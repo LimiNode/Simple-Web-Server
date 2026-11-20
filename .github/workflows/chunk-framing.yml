@@ -1,0 +1,72 @@
+name: Chunk framing corrective
+
+on:
+  pull_request:
+  push:
+    branches: [fix/strict-chunk-framing]
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        standard: [11, 17]
+        configuration: [Debug, Release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: 03cf5f86a780dd102f1cdd3a59d1244d12143e46
+          path: build/asio
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Configure standalone Asio
+        run: >-
+          cmake -S . -B build/tests -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+          -DCMAKE_CXX_STANDARD=${{ matrix.standard }}
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          -DUSE_STANDALONE_ASIO=ON -DUSE_OPENSSL=OFF -DBUILD_TESTING=ON
+          -DASIO_PATH=${{ github.workspace }}/build/asio/include
+      - run: cmake --build build/tests --parallel 2
+      - run: ctest --test-dir build/tests --output-on-failure --timeout 60
+
+  boost:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libboost-system-dev libboost-filesystem-dev libssl-dev ninja-build
+      - name: Configure Boost.Asio and OpenSSL
+        run: >-
+          cmake -S . -B build/boost -G Ninja
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=11
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON -DBUILD_TESTING=ON
+      - run: cmake --build build/boost --parallel 2
+      - run: ctest --test-dir build/boost --output-on-failure --timeout 60
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: 03cf5f86a780dd102f1cdd3a59d1244d12143e46
+          path: build/asio
+      - name: Configure ASan and UBSan
+        run: >-
+          cmake -S . -B build/sanitizers -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=17
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          -DUSE_STANDALONE_ASIO=ON -DUSE_OPENSSL=OFF -DBUILD_TESTING=ON
+          -DASIO_PATH=${{ github.workspace }}/build/asio/include
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - run: cmake --build build/sanitizers --parallel 2
+      - run: ctest --test-dir build/sanitizers --output-on-failure --timeout 60

@@ -633,8 +633,8 @@ namespace SimpleWeb {
             }
           }
           else if((header_it = session->request->header.find("Transfer-Encoding")) != session->request->header.end() && header_it->second == "chunked") {
-            // Expect hex number to not exceed 16 bytes (64-bit number), but take into account previous additional read bytes
-            auto chunk_size_streambuf = std::make_shared<asio::streambuf>(std::max<std::size_t>(16 + 2, session->request->streambuf->size()));
+            // Chunk extensions share the configured request-buffer bound.
+            auto chunk_size_streambuf = std::make_shared<asio::streambuf>(session->request->streambuf->max_size());
 
             // Move leftover bytes
             auto &source = *session->request->streambuf;
@@ -652,6 +652,122 @@ namespace SimpleWeb {
       });
     }
 
+    static bool parse_chunk_size(const std::string &line, std::size_t &chunk_size) noexcept {
+      auto is_token = [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+               c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' ||
+               c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+      };
+      std::size_t pos = 0;
+      chunk_size = 0;
+      while(pos < line.size()) {
+        auto c = static_cast<unsigned char>(line[pos]);
+        unsigned int digit;
+        if(c >= '0' && c <= '9')
+          digit = c - '0';
+        else if(c >= 'A' && c <= 'F')
+          digit = c - 'A' + 10;
+        else if(c >= 'a' && c <= 'f')
+          digit = c - 'a' + 10;
+        else
+          break;
+        if(chunk_size > ((std::numeric_limits<std::size_t>::max)() - digit) / 16)
+          return false;
+        chunk_size = chunk_size * 16 + digit;
+        ++pos;
+      }
+      if(pos == 0)
+        return false;
+
+      // Validate complete chunk extensions before ignoring their values.
+      auto skip_whitespace = [&line, &pos] {
+        while(pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
+          ++pos;
+      };
+      while(pos < line.size()) {
+        skip_whitespace();
+        if(pos == line.size() || line[pos++] != ';')
+          return false;
+        skip_whitespace();
+        auto name_start = pos;
+        while(pos < line.size() && is_token(static_cast<unsigned char>(line[pos])))
+          ++pos;
+        if(pos == name_start)
+          return false;
+        auto name_end = pos;
+        skip_whitespace();
+        if(pos < line.size() && line[pos] == '=') {
+          ++pos;
+          skip_whitespace();
+          if(pos == line.size())
+            return false;
+          if(line[pos] == '"') {
+            ++pos;
+            bool closed = false;
+            while(pos < line.size()) {
+              auto c = static_cast<unsigned char>(line[pos++]);
+              if(c == '"') {
+                closed = true;
+                break;
+              }
+              if(c == '\\') {
+                if(pos == line.size())
+                  return false;
+                c = static_cast<unsigned char>(line[pos++]);
+              }
+              if(c != '\t' && (c < 0x20 || c == 0x7f))
+                return false;
+            }
+            if(!closed)
+              return false;
+          }
+          else {
+            auto value_start = pos;
+            while(pos < line.size() && is_token(static_cast<unsigned char>(line[pos])))
+              ++pos;
+            if(pos == value_start)
+              return false;
+          }
+        }
+        else
+          pos = name_end;
+      }
+      return true;
+    }
+
+    void read_chunked_transfer_encoded_end(const std::shared_ptr<Session> &session, const std::shared_ptr<asio::streambuf> &chunk_size_streambuf, bool last_chunk) {
+      auto read_next = [this, session, chunk_size_streambuf, last_chunk](const error_code &ec, std::size_t /*bytes_transferred*/) {
+        auto lock = session->connection->handler_runner->continue_lock();
+        if(!lock)
+          return;
+        if(ec) {
+          if(this->on_error)
+            this->on_error(session->request, ec);
+          return;
+        }
+        std::istream istream(chunk_size_streambuf.get());
+        if(istream.get() != '\r' || istream.get() != '\n') {
+          if(this->on_error)
+            this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
+          return;
+        }
+        if(last_chunk) {
+          // Only an empty trailer section is supported. Never treat trailers as a next request.
+          auto &source = *chunk_size_streambuf;
+          auto &target = *session->request->streambuf;
+          target.commit(asio::buffer_copy(target.prepare(source.size()), source.data()));
+          source.consume(source.size());
+          this->find_resource(session);
+        }
+        else
+          this->read_chunked_transfer_encoded(session, chunk_size_streambuf);
+      };
+      if(chunk_size_streambuf->size() < 2)
+        asio::async_read(*session->connection->socket, *chunk_size_streambuf, asio::transfer_exactly(2 - chunk_size_streambuf->size()), std::move(read_next));
+      else
+        read_next(error_code(), 0);
+    }
+
     void read_chunked_transfer_encoded(const std::shared_ptr<Session> &session, const std::shared_ptr<asio::streambuf> &chunk_size_streambuf) {
       asio::async_read_until(*session->connection->socket, *chunk_size_streambuf, "\r\n", [this, session, chunk_size_streambuf](const error_code &ec, size_t bytes_transferred) {
         auto lock = session->connection->handler_runner->continue_lock();
@@ -662,18 +778,17 @@ namespace SimpleWeb {
           std::istream istream(chunk_size_streambuf.get());
           std::string line;
           std::getline(istream, line);
-          bytes_transferred -= line.size() + 1;
-          unsigned long chunk_size = 0;
-          try {
-            chunk_size = std::stoul(line, 0, 16);
-          }
-          catch(...) {
+          auto complete_line = !line.empty() && line.back() == '\r' && line.size() == bytes_transferred - 1;
+          if(complete_line)
+            line.pop_back();
+          std::size_t chunk_size = 0;
+          if(!complete_line || !parse_chunk_size(line, chunk_size)) {
             if(this->on_error)
               this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
             return;
           }
 
-          if(chunk_size + session->request->content_streambuf.size() > session->request->content_streambuf.max_size()) {
+          if(chunk_size > session->request->content_streambuf.max_size() - session->request->content_streambuf.size()) {
             auto response = std::shared_ptr<Response>(new Response(session, this->config.timeout_content));
             response->write(StatusCode::client_error_payload_too_large);
             if(this->on_error)
@@ -681,22 +796,7 @@ namespace SimpleWeb {
             return;
           }
 
-          auto read_next = [this, chunk_size](const std::shared_ptr<Session> &session, const std::shared_ptr<asio::streambuf> &chunk_size_streambuf) {
-            if(chunk_size == 0) {
-              if(chunk_size_streambuf->size() > 0) {
-                // Remaining bytes are the beginning of the next request
-                auto &source = *chunk_size_streambuf;
-                auto &target = *session->request->streambuf;
-                target.commit(asio::buffer_copy(target.prepare(chunk_size_streambuf->size()), source.data(), chunk_size_streambuf->size()));
-                source.consume(chunk_size_streambuf->size());
-              }
-              this->find_resource(session);
-            }
-            else
-              this->read_chunked_transfer_encoded(session, chunk_size_streambuf);
-          };
-
-          auto num_additional_bytes = chunk_size_streambuf->size() - bytes_transferred;
+          auto num_additional_bytes = chunk_size_streambuf->size();
 
           auto bytes_to_move = std::min<std::size_t>(chunk_size, num_additional_bytes);
           if(bytes_to_move > 0) {
@@ -708,50 +808,19 @@ namespace SimpleWeb {
           }
 
           if(chunk_size > num_additional_bytes) {
-            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
+            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf](const error_code &ec, size_t /*bytes_transferred*/) {
               auto lock = session->connection->handler_runner->continue_lock();
               if(!lock)
                 return;
 
-              if(!ec) {
-                // Remove "\r\n"
-                auto null_buffer = std::make_shared<asio::streambuf>(2);
-                asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
-                  auto lock = session->connection->handler_runner->continue_lock();
-                  if(!lock)
-                    return;
-                  if(!ec)
-                    read_next(session, chunk_size_streambuf);
-                  else
-                    this->on_error(session->request, ec);
-                });
-              }
+              if(!ec)
+                this->read_chunked_transfer_encoded_end(session, chunk_size_streambuf, false);
               else if(this->on_error)
                 this->on_error(session->request, ec);
             });
           }
-          else if(2 + chunk_size > num_additional_bytes) { // If only end of chunk remains unread (\n or \r\n)
-            // Remove "\r\n"
-            if(2 + chunk_size - num_additional_bytes == 1)
-              istream.get();
-            auto null_buffer = std::make_shared<asio::streambuf>(2);
-            asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2 + chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
-              auto lock = session->connection->handler_runner->continue_lock();
-              if(!lock)
-                return;
-              if(!ec)
-                read_next(session, chunk_size_streambuf);
-              else
-                this->on_error(session->request, ec);
-            });
-          }
-          else {
-            // Remove "\r\n"
-            istream.get();
-            istream.get();
-
-            read_next(session, chunk_size_streambuf);
-          }
+          else
+            this->read_chunked_transfer_encoded_end(session, chunk_size_streambuf, chunk_size == 0);
         }
         else if(this->on_error)
           this->on_error(session->request, ec);
