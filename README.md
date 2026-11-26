@@ -1,5 +1,38 @@
 # Simple-Web-Server
 
+## Fork maintenance scope
+
+This fork preserves the upstream license and history. Its `upstream-gitlab`
+baseline is GitLab commit `546895a93a29062bb178367b46c7afb72da9881e`; the archived
+GitHub `master` branch is retained separately and has not been rewritten.
+
+The server-side chunk-framing corrective validates the complete hexadecimal
+size and optional token/quoted extensions, detects size overflow, and checks
+every chunk-data CRLF before dispatching a request. The complete zero-chunk
+terminator is required. Only empty trailer sections are supported; a nonempty
+trailer section is rejected before the application handler rather than being
+interpreted as another request. Valid bytes after the empty trailer terminator
+remain available for the next request.
+
+Malformed framing may close the connection and report `on_error` without an
+HTTP response. This narrow correction does not change the client decoder or
+claim complete HTTP parser hardening.
+
+Run the existing suite and deterministic chunk-framing regressions with a
+local standalone Asio installation (no dependency download at configure):
+
+```sh
+cmake -S . -B build/debug -DUSE_STANDALONE_ASIO=ON -DUSE_OPENSSL=OFF \
+  -DASIO_PATH=/path/to/asio/include -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_STANDARD=11 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DBUILD_TESTING=ON
+cmake --build build/debug
+ctest --test-dir build/debug --output-on-failure --timeout 60
+```
+
+Repeat in a separate Release tree and with C++17. The added tests keep their
+checks active in Release and script read boundaries independently of TCP packet
+coalescing. GitHub CI also exercises Boost.Asio and ASan/UBSan.
+
 A very simple, fast, multithreaded, platform independent HTTP and HTTPS server and client library implemented using C++11 and Asio (both Boost.Asio and standalone Asio can be used). Created to be an easy way to make REST resources available from C++ applications. 
 
 See https://gitlab.com/eidheim/Simple-WebSocket-Server for an easy way to make WebSocket/WebSocket Secure endpoints in C++. Also, feel free to check out the new C++ IDE supporting C++11/14/17: https://gitlab.com/cppit/jucipp. 
